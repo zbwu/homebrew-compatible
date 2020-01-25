@@ -1,0 +1,369 @@
+diff --git a/src/conf/domain_conf.c b/src/conf/domain_conf.c
+index ee57152da7..03ef701f0f 100644
+--- a/src/conf/domain_conf.c
++++ b/src/conf/domain_conf.c
+@@ -117,6 +117,7 @@ VIR_ENUM_IMPL(virDomainVirt,
+               "qemu",
+               "kqemu",
+               "kvm",
++              "hvf",
+               "xen",
+               "lxc",
+               "uml",
+@@ -15395,6 +15396,7 @@ virDomainVideoDefaultType(const virDomainDef *def)
+     case VIR_DOMAIN_VIRT_QEMU:
+     case VIR_DOMAIN_VIRT_KQEMU:
+     case VIR_DOMAIN_VIRT_KVM:
++    case VIR_DOMAIN_VIRT_HVF:
+     case VIR_DOMAIN_VIRT_LXC:
+     case VIR_DOMAIN_VIRT_UML:
+     case VIR_DOMAIN_VIRT_OPENVZ:
+diff --git a/src/conf/domain_conf.h b/src/conf/domain_conf.h
+index 6ae89fa498..012048ed46 100644
+--- a/src/conf/domain_conf.h
++++ b/src/conf/domain_conf.h
+@@ -124,6 +124,7 @@ typedef enum {
+     VIR_DOMAIN_VIRT_QEMU,
+     VIR_DOMAIN_VIRT_KQEMU,
+     VIR_DOMAIN_VIRT_KVM,
++    VIR_DOMAIN_VIRT_HVF,
+     VIR_DOMAIN_VIRT_XEN,
+     VIR_DOMAIN_VIRT_LXC,
+     VIR_DOMAIN_VIRT_UML,
+diff --git a/src/qemu/qemu_capabilities.c b/src/qemu/qemu_capabilities.c
+index 84c62a4e28..697697d60a 100644
+--- a/src/qemu/qemu_capabilities.c
++++ b/src/qemu/qemu_capabilities.c
+@@ -553,6 +553,7 @@ VIR_ENUM_IMPL(virQEMUCaps,
+               "blockdev-file-dynamic-auto-read-only",
+               "savevm-monitor-nodes",
+               "drive-nvme",
++              "hvf",
+     );
+ 
+ 
+@@ -634,6 +635,7 @@ struct _virQEMUCaps {
+ 
+     /* Capabilities which may differ depending on the accelerator. */
+     virQEMUCapsAccel kvm;
++    virQEMUCapsAccel hvf;
+     virQEMUCapsAccel tcg;
+ };
+ 
+@@ -734,8 +736,10 @@ virQEMUCapsGetAccel(virQEMUCapsPtr qemuCaps,
+ {
+     if (type == VIR_DOMAIN_VIRT_KVM)
+         return &qemuCaps->kvm;
+-
+-    return &qemuCaps->tcg;
++    else if (type == VIR_DOMAIN_VIRT_HVF)
++        return &qemuCaps->hvf;
++    else
++        return &qemuCaps->tcg;
+ }
+ 
+ 
+@@ -863,6 +867,8 @@ virQEMUCapsGetMachineTypesCaps(virQEMUCapsPtr qemuCaps,
+      * take the set of machine types we probed first. */
+     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_KVM))
+         accel = &qemuCaps->kvm;
++    else if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_HVF))
++        accel = &qemuCaps->hvf;
+     else
+         accel = &qemuCaps->tcg;
+ 
+@@ -991,6 +997,17 @@ virQEMUCapsInitGuestFromBinary(virCapsPtr caps,
+         }
+     }
+ 
++    if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_HVF)) {
++        if (virCapabilitiesAddGuestDomain(guest,
++                                          VIR_DOMAIN_VIRT_HVF,
++                                          NULL,
++                                          NULL,
++                                          0,
++                                          NULL) == NULL) {
++            goto cleanup;
++        }
++    }
++
+     if ((ARCH_IS_X86(guestarch) || guestarch == VIR_ARCH_AARCH64))
+         virCapabilitiesAddGuestFeatureWithToggle(guest, VIR_CAPS_GUEST_FEATURE_TYPE_ACPI,
+                                                  true, true);
+@@ -2149,6 +2166,10 @@ virQEMUCapsIsVirtTypeSupported(virQEMUCapsPtr qemuCaps,
+         virQEMUCapsGet(qemuCaps, QEMU_CAPS_KVM))
+         return true;
+ 
++    if (virtType == VIR_DOMAIN_VIRT_HVF &&
++        virQEMUCapsGet(qemuCaps, QEMU_CAPS_HVF))
++        return true;
++
+     return false;
+ }
+ 
+@@ -2163,7 +2184,7 @@ virQEMUCapsIsCPUModeSupported(virQEMUCapsPtr qemuCaps,
+ 
+     switch (mode) {
+     case VIR_CPU_MODE_HOST_PASSTHROUGH:
+-        return type == VIR_DOMAIN_VIRT_KVM &&
++        return (type == VIR_DOMAIN_VIRT_KVM || type == VIR_DOMAIN_VIRT_HVF) &&
+                virQEMUCapsGuestIsNative(hostarch, qemuCaps->arch);
+ 
+     case VIR_CPU_MODE_HOST_MODEL:
+@@ -2726,7 +2747,7 @@ virQEMUCapsProbeQMPHostCPU(virQEMUCapsPtr qemuCaps,
+                            qemuMonitorPtr mon,
+                            virDomainVirtType virtType)
+ {
+-    const char *model = virtType == VIR_DOMAIN_VIRT_KVM ? "host" : "max";
++    const char *model = "max";
+     qemuMonitorCPUModelInfoPtr modelInfo = NULL;
+     qemuMonitorCPUModelInfoPtr nonMigratable = NULL;
+     virHashTablePtr hash = NULL;
+@@ -2735,6 +2756,9 @@ virQEMUCapsProbeQMPHostCPU(virQEMUCapsPtr qemuCaps,
+     bool fail_no_props = true;
+     int ret = -1;
+ 
++    if (virtType == VIR_DOMAIN_VIRT_KVM ||  virtType == VIR_DOMAIN_VIRT_HVF)
++        model = "host";
++
+     if (!virQEMUCapsGet(qemuCaps, QEMU_CAPS_QUERY_CPU_MODEL_EXPANSION))
+         return 0;
+ 
+@@ -2948,6 +2972,22 @@ virQEMUCapsProbeQMPKVMState(virQEMUCapsPtr qemuCaps,
+     return 0;
+ }
+ 
++static int
++virQEMUCapsProbeQMPHVFState(virQEMUCapsPtr qemuCaps,
++                            qemuMonitorPtr mon)
++{
++
++    bool enabled = false;
++    bool present = false;
++
++    if (qemuMonitorGetKVMState(mon, &enabled, &present) < 0)
++        return -1;
++
++    virQEMUCapsSet(qemuCaps, QEMU_CAPS_HVF);
++
++    return 0;
++}
++
+ struct virQEMUCapsCommandLineProps {
+     const char *option;
+     const char *param;
+@@ -3201,7 +3241,7 @@ virQEMUCapsInitCPUModelS390(virQEMUCapsPtr qemuCaps,
+     size_t i;
+ 
+     if (!modelInfo) {
+-        if (type == VIR_DOMAIN_VIRT_KVM) {
++        if (type == VIR_DOMAIN_VIRT_KVM || type == VIR_DOMAIN_VIRT_HVF) {
+             virReportError(VIR_ERR_INTERNAL_ERROR,
+                            _("missing host CPU model info from QEMU "
+                              "capabilities for binary %s"),
+@@ -3422,7 +3462,7 @@ virQEMUCapsInitHostCPUModel(virQEMUCapsPtr qemuCaps,
+                   virArchToString(qemuCaps->arch),
+                   virDomainVirtTypeToString(type));
+         goto error;
+-    } else if (type == VIR_DOMAIN_VIRT_KVM &&
++    } else if ((type == VIR_DOMAIN_VIRT_KVM || type == VIR_DOMAIN_VIRT_HVF) &&
+                virCPUGetHostIsSupported(qemuCaps->arch)) {
+         if (!(fullCPU = virQEMUCapsProbeHostCPU(qemuCaps->arch, NULL)))
+             goto error;
+@@ -3773,7 +3813,12 @@ virQEMUCapsLoadAccel(virQEMUCapsPtr qemuCaps,
+                      virDomainVirtType type)
+ {
+     virQEMUCapsAccelPtr caps = virQEMUCapsGetAccel(qemuCaps, type);
+-    const char *typeStr = type == VIR_DOMAIN_VIRT_KVM ? "kvm" : "tcg";
++    const char *typeStr = "tcg";
++
++    if (type == VIR_DOMAIN_VIRT_KVM)
++        typeStr = "kvm";
++    else if (type == VIR_DOMAIN_VIRT_HVF)
++        typeStr = "hvf";
+ 
+     if (virQEMUCapsLoadHostCPUModelInfo(caps, ctxt, typeStr) < 0)
+         return -1;
+@@ -4013,6 +4058,7 @@ virQEMUCapsLoadCache(virArch hostArch,
+     VIR_FREE(str);
+ 
+     if (virQEMUCapsLoadAccel(qemuCaps, ctxt, VIR_DOMAIN_VIRT_KVM) < 0 ||
++        virQEMUCapsLoadAccel(qemuCaps, ctxt, VIR_DOMAIN_VIRT_HVF) < 0 ||
+         virQEMUCapsLoadAccel(qemuCaps, ctxt, VIR_DOMAIN_VIRT_QEMU) < 0)
+         goto cleanup;
+ 
+@@ -4086,6 +4132,7 @@ virQEMUCapsLoadCache(virArch hostArch,
+         goto cleanup;
+ 
+     virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_KVM);
++    virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_HVF);
+     virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_QEMU);
+ 
+     if (virXPathBoolean("boolean(./kvmSupportsNesting)", ctxt) > 0)
+@@ -4227,7 +4274,12 @@ virQEMUCapsFormatAccel(virQEMUCapsPtr qemuCaps,
+                        virDomainVirtType type)
+ {
+     virQEMUCapsAccelPtr caps = virQEMUCapsGetAccel(qemuCaps, type);
+-    const char *typeStr = type == VIR_DOMAIN_VIRT_KVM ? "kvm" : "tcg";
++    const char *typeStr = "tcg";
++
++    if (type == VIR_DOMAIN_VIRT_KVM)
++        typeStr = "kvm";
++    else if (type == VIR_DOMAIN_VIRT_HVF)
++        typeStr = "hvf";
+ 
+     virQEMUCapsFormatHostCPUModelInfo(caps, buf, typeStr);
+     virQEMUCapsFormatCPUModels(caps, buf, typeStr);
+@@ -4301,6 +4353,7 @@ virQEMUCapsFormatCache(virQEMUCapsPtr qemuCaps)
+                       virArchToString(qemuCaps->arch));
+ 
+     virQEMUCapsFormatAccel(qemuCaps, &buf, VIR_DOMAIN_VIRT_KVM);
++    virQEMUCapsFormatAccel(qemuCaps, &buf, VIR_DOMAIN_VIRT_HVF);
+     virQEMUCapsFormatAccel(qemuCaps, &buf, VIR_DOMAIN_VIRT_QEMU);
+ 
+     for (i = 0; i < qemuCaps->ngicCapabilities; i++) {
+@@ -4827,8 +4880,13 @@ virQEMUCapsInitQMPMonitor(virQEMUCapsPtr qemuCaps,
+     if (virQEMUCapsProbeQMPKVMState(qemuCaps, mon) < 0)
+         return -1;
+ 
++    if (virQEMUCapsProbeQMPHVFState(qemuCaps, mon) < 0)
++        return -1;
++
+     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_KVM))
+         type = VIR_DOMAIN_VIRT_KVM;
++    else if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_HVF))
++        type = VIR_DOMAIN_VIRT_HVF;
+     else
+         type = VIR_DOMAIN_VIRT_QEMU;
+ 
+@@ -4953,7 +5011,7 @@ virQEMUCapsInitQMP(virQEMUCapsPtr qemuCaps,
+      * for TCG capabilities by asking the same binary again and turning KVM
+      * off.
+      */
+-    if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_KVM) &&
++    if ((virQEMUCapsGet(qemuCaps, QEMU_CAPS_KVM) || virQEMUCapsGet(qemuCaps, QEMU_CAPS_HVF)) &&
+         virQEMUCapsInitQMPSingle(qemuCaps, libDir, runUid, runGid, true) < 0)
+         return -1;
+ 
+@@ -5002,6 +5060,7 @@ virQEMUCapsNewForBinaryInternal(virArch hostArch,
+     qemuCaps->libvirtVersion = LIBVIR_VERSION_NUMBER;
+ 
+     virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_KVM);
++    virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_HVF);
+     virQEMUCapsInitHostCPUModel(qemuCaps, hostArch, VIR_DOMAIN_VIRT_QEMU);
+ 
+     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_KVM)) {
+@@ -5326,15 +5385,18 @@ virQEMUCapsCacheLookupDefault(virFileCachePtr cache,
+ 
+     if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_KVM))
+         capsType = VIR_DOMAIN_VIRT_KVM;
++    else if (virQEMUCapsGet(qemuCaps, QEMU_CAPS_HVF))
++        capsType = VIR_DOMAIN_VIRT_HVF;
+     else
+         capsType = VIR_DOMAIN_VIRT_QEMU;
+ 
+     if (virttype == VIR_DOMAIN_VIRT_NONE)
+         virttype = capsType;
+ 
+-    if (virttype == VIR_DOMAIN_VIRT_KVM && capsType == VIR_DOMAIN_VIRT_QEMU) {
++    if ((virttype == VIR_DOMAIN_VIRT_KVM || virttype == VIR_DOMAIN_VIRT_HVF) &&
++        capsType == VIR_DOMAIN_VIRT_QEMU) {
+         virReportError(VIR_ERR_INVALID_ARG,
+-                       _("KVM is not supported by '%s' on this host"),
++                       _("KVM/HVF is not supported by '%s' on this host"),
+                        binary);
+         goto cleanup;
+     }
+@@ -5761,7 +5823,7 @@ virQEMUCapsSupportsGICVersion(virQEMUCapsPtr qemuCaps,
+             cap->implementation & VIR_GIC_IMPLEMENTATION_KERNEL)
+             return true;
+ 
+-        if (virtType == VIR_DOMAIN_VIRT_QEMU &&
++        if ((virtType == VIR_DOMAIN_VIRT_QEMU || virtType == VIR_DOMAIN_VIRT_HVF) &&
+             cap->implementation & VIR_GIC_IMPLEMENTATION_EMULATED)
+             return true;
+     }
+diff --git a/src/qemu/qemu_capabilities.h b/src/qemu/qemu_capabilities.h
+index 193c19fc81..9969e28df9 100644
+--- a/src/qemu/qemu_capabilities.h
++++ b/src/qemu/qemu_capabilities.h
+@@ -534,6 +534,7 @@ typedef enum { /* virQEMUCapsFlags grouping marker for syntax-check */
+     QEMU_CAPS_BLOCK_FILE_AUTO_READONLY_DYNAMIC, /* the auto-read-only property of block backends for files is dynamic */
+     QEMU_CAPS_SAVEVM_MONITOR_NODES, /* 'savevm' handles monitor-owned nodes properly */
+     QEMU_CAPS_DRIVE_NVME, /* -drive file.driver=nvme */
++    QEMU_CAPS_HVF, /* Whether HVF is usable / was used during probing */
+ 
+     QEMU_CAPS_LAST /* this must always be the last item */
+ } virQEMUCapsFlags;
+diff --git a/src/qemu/qemu_command.c b/src/qemu/qemu_command.c
+index 904d2beab5..7b3c5f12ca 100644
+--- a/src/qemu/qemu_command.c
++++ b/src/qemu/qemu_command.c
+@@ -6878,6 +6878,10 @@ qemuBuildMachineCommandLine(virCommandPtr cmd,
+         virBufferAddLit(&buf, ",accel=kvm");
+         break;
+ 
++    case VIR_DOMAIN_VIRT_HVF:
++        virBufferAddLit(&buf, ",accel=hvf");
++        break;
++
+     case VIR_DOMAIN_VIRT_KQEMU:
+     case VIR_DOMAIN_VIRT_XEN:
+     case VIR_DOMAIN_VIRT_LXC:
+diff --git a/src/qemu/qemu_conf.c b/src/qemu/qemu_conf.c
+index b62dd1df52..8370af5021 100644
+--- a/src/qemu/qemu_conf.c
++++ b/src/qemu/qemu_conf.c
+@@ -1238,6 +1238,7 @@ virCapsPtr virQEMUDriverCreateCapabilities(virQEMUDriverPtr driver)
+     /* Security driver data */
+     const char *doi, *model, *lbl, *type;
+     const int virtTypes[] = {VIR_DOMAIN_VIRT_KVM,
++                             VIR_DOMAIN_VIRT_HVF,
+                              VIR_DOMAIN_VIRT_QEMU,};
+ 
+     /* Basic host arch / guest machine capabilities */
+diff --git a/src/qemu/qemu_domain.c b/src/qemu/qemu_domain.c
+index a6dde15bad..7effac37c1 100644
+--- a/src/qemu/qemu_domain.c
++++ b/src/qemu/qemu_domain.c
+@@ -4655,7 +4655,8 @@ qemuDomainDefSetDefaultCPU(virDomainDefPtr def,
+         return 0;
+     }
+ 
+-    if (STREQ(model, "host") && def->virtType != VIR_DOMAIN_VIRT_KVM) {
++    if (STREQ(model, "host") &&
++        (def->virtType != VIR_DOMAIN_VIRT_KVM && def->virtType != VIR_DOMAIN_VIRT_HVF)) {
+         virReportError(VIR_ERR_INTERNAL_ERROR, "%s",
+                        _("QEMU reports invalid default CPU model \"host\" "
+                          "for non-kvm domain virt type"));
+diff --git a/src/security/virt-aa-helper.c b/src/security/virt-aa-helper.c
+index 3ce58c8a6c..3c7d53205d 100644
+--- a/src/security/virt-aa-helper.c
++++ b/src/security/virt-aa-helper.c
+@@ -285,6 +285,7 @@ create_profile(const char *profile, const char *profile_name,
+     case VIR_DOMAIN_VIRT_QEMU:
+     case VIR_DOMAIN_VIRT_KQEMU:
+     case VIR_DOMAIN_VIRT_KVM:
++    case VIR_DOMAIN_VIRT_HVF:
+         driver_name = "qemu";
+         break;
+     default:
+@@ -1265,7 +1266,7 @@ get_files(vahControl * ctl)
+         }
+     }
+ 
+-    if (ctl->def->virtType == VIR_DOMAIN_VIRT_KVM) {
++    if (ctl->def->virtType == ) {
+         for (i = 0; i < ctl->def->nnets; i++) {
+             virDomainNetDefPtr net = ctl->def->nets[i];
+             if (net && virDomainNetGetModelString(net)) {
+@@ -1477,7 +1478,8 @@ main(int argc, char **argv)
+         } else {
+             if (ctl->def->virtType == VIR_DOMAIN_VIRT_QEMU ||
+                 ctl->def->virtType == VIR_DOMAIN_VIRT_KQEMU ||
+-                ctl->def->virtType == VIR_DOMAIN_VIRT_KVM) {
++                ctl->def->virtType == VIR_DOMAIN_VIRT_KVM ||
++                ctl->def->virtType == VIR_DOMAIN_VIRT_HVF) {
+                 virBufferAsprintf(&buf, "  \"%s/log/libvirt/**/%s.log\" w,\n",
+                                   LOCALSTATEDIR, ctl->def->name);
+                 virBufferAsprintf(&buf, "  \"%s/lib/libvirt/qemu/domain-%s/monitor.sock\" rw,\n",
